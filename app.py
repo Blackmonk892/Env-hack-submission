@@ -21,6 +21,7 @@ import streamlit as st
 
 from unitwatt.analytics import idle_analysis
 from unitwatt.audit import sha256_bytes
+from unitwatt.aws_integration import AWSClient, AWSConfig, audit_trail_csv_bytes
 from unitwatt.emissions import default_value_comparison
 from unitwatt.ingest import factor_table, parse_daily_entry
 from unitwatt.ledger import monthly_summary
@@ -89,6 +90,21 @@ R = load(seed)
 F, T, L = R.factory, R.tariff, R.ledger
 S = R.savings
 
+
+@st.cache_resource(show_spinner="Syncing the daily ledger to AWS (DynamoDB)...")
+def _auto_sync_to_aws(seed: int, factory_id: str):
+    """Runs once per (seed, factory) when AWS is configured, so the pipeline's output
+    lands in AWS automatically instead of needing a manual click every demo run."""
+    cfg = AWSConfig.from_env()
+    client = AWSClient(cfg)
+    if not client.available().ok:
+        return None
+    client.ensure_resources()
+    return client.sync_ledger(L, factory_id)
+
+
+auto_sync_status = _auto_sync_to_aws(seed, F.id) if AWSConfig.from_env().enabled else None
+
 with st.sidebar:
     st.divider()
     st.markdown(f"**{F.name}**")
@@ -99,6 +115,8 @@ with st.sidebar:
         f"Data: **{L.index.min():%d %b} to {L.index.max():%d %b %Y}**"
     )
     st.metric("Data quality score", f"{R.quality.score:.1f} / 100", f"Grade {R.quality.grade}", delta_color="off", delta_arrow="off", border=True)
+    if auto_sync_status is not None:
+        (st.success if auto_sync_status.ok else st.error)(f"☁️ AWS: {auto_sync_status.message}", icon="☁️")
     st.warning(
         "Synthetic demo unit. Tariff values marked *illustrative* must be checked against the current tariff order.",
         icon="⚠️",
@@ -106,7 +124,7 @@ with st.sidebar:
 
 tabs = st.tabs(
     ["Owner", "WhatsApp bot", "Bill check", "Energy per product", "Schedule", "Savings proof", "Carbon & CBAM", "Alerts", "Data & audit",
-     "Impact model"]
+     "Impact model", "☁️ AWS Cloud Sync"]
 )
 
 # --------------------------------------------------------------------------------------
@@ -852,3 +870,101 @@ with tabs[9]:
     c[0].metric(f"{units:,} units, full shift", format_lakh(full_["fleet_rs_year"]), f"{full_['fleet_tco2_year']:,.0f} tCO₂/yr", delta_color="off", delta_arrow="off", border=True)
     c[1].metric(f"{units:,} units, {realisation:.0%} of the shift", format_lakh(real_["fleet_rs_year"]), f"{real_['fleet_tco2_year']:,.0f} tCO₂/yr", delta_color="off", delta_arrow="off", border=True)
     c[2].metric("If only half the load can shift", format_lakh(half_["fleet_rs_year"]), "CO₂ unchanged: shifting saves no energy", delta_color="off", delta_arrow="off", border=True)
+
+# --------------------------------------------------------------------------------------
+# 10. AWS Cloud Sync — the mandatory AWS integration (Environmental Hacks, Track 03)
+# --------------------------------------------------------------------------------------
+
+with tabs[10]:
+    st.subheader("AWS Cloud Sync")
+    st.caption(
+        "UnitWatt is software-only, so AWS carries the two things a factory ledger needs once it leaves one "
+        "laptop: **Amazon DynamoDB** for queryable daily energy-per-unit telemetry, and **Amazon S3** for the "
+        "audit-ready savings report and SHA-256 audit trail a bank or auditor can be handed a link to. "
+        "When enabled, the daily ledger syncs to DynamoDB automatically as soon as this app loads data "
+        "(see the sidebar) — the buttons below are for provisioning and for pushing the report/audit-trail "
+        "files to S3 on demand."
+    )
+
+    cfg = AWSConfig.from_env()
+    client = AWSClient(cfg)
+    status = client.available()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Integration", "Enabled" if cfg.enabled else "Off", help="Set UNITWATT_AWS_ENABLED=1 in .env to turn this on.")
+    c2.metric("Region", cfg.region)
+    c3.metric("Endpoint", "LocalStack" if cfg.endpoint_url else ("AWS" if cfg.access_key_set else "No credentials yet"))
+
+    with st.expander("Architecture: where AWS fits", expanded=not cfg.enabled):
+        st.markdown(
+            "```\n"
+            "Bills / meter CSVs / registers  →  UnitWatt pipeline (local, offline)  →  daily ledger (pandas)\n"
+            "                                                                               │\n"
+            "                                        ┌──────────────────────────────────────┴───────────────────────┐\n"
+            "                                        ▼                                                                ▼\n"
+            "                          Amazon DynamoDB (unitwatt_daily_ledger)               Amazon S3 (unitwatt-energy-ledger)\n"
+            "                          one item per factory-day: elec_kwh,                   savings_reports/<factory>/<date>.pdf\n"
+            "                          sec_kwh_per_t, total_t, grid/DG split                  audit_trail/<factory>/<date>.csv\n"
+            "```\n"
+        )
+        st.markdown(
+            "- **DynamoDB** (`unitwatt_daily_ledger`, partition key `factory_id`, sort key `date`): the per-day "
+            "energy-per-unit series, queryable by any downstream tool (a banker's dashboard, a scheme officer's "
+            "portal) without re-running the Python pipeline.\n"
+            "- **S3** (`unitwatt-energy-ledger`): the IPMVP savings report PDF and the hash-chained audit trail "
+            "export, so \"audit-ready proof of savings\" has a durable, shareable home.\n"
+            "- Both run against **LocalStack** with zero AWS account (`AWS_ENDPOINT_URL=http://localhost:4566`), "
+            "satisfying the hackathon's \"Build It\" track, or against real AWS once credentials are added to `.env` "
+            "— the application code is identical either way.\n"
+            "- boto3 calls are wrapped to fail soft: a missing or expired credential shows a status message here, "
+            "never a crash, so the rest of the dashboard always works."
+        )
+
+    if not status.ok:
+        st.info(status.message, icon="ℹ️")
+        st.caption(
+            "To try it now with no AWS account: run `pip install localstack && localstack start`, then in `.env` set "
+            "`UNITWATT_AWS_ENABLED=1` and `AWS_ENDPOINT_URL=http://localhost:4566`. To use real AWS, also set "
+            "`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`."
+        )
+    else:
+        if st.button("Provision AWS resources (create bucket + table if missing)"):
+            with st.spinner("Checking/creating S3 bucket and DynamoDB table..."):
+                res = client.ensure_resources()
+            (st.success if res.ok else st.error)(res.message)
+
+        colA, colB = st.columns(2, gap="large")
+        with colA:
+            st.markdown("**Sync the daily ledger to DynamoDB**")
+            st.caption(f"{len(L)} days for {F.id} → table `{cfg.table}`")
+            if st.button("Sync ledger to DynamoDB", type="primary"):
+                with st.spinner("Writing daily ledger items..."):
+                    res = client.sync_ledger(L, F.id)
+                (st.success if res.ok else st.error)(res.message)
+            count = client.ledger_item_count(F.id)
+            if count is not None:
+                st.metric("Items currently in DynamoDB for this factory", count)
+
+        with colB:
+            st.markdown("**Upload audit-ready artifacts to S3**")
+            st.caption(f"→ bucket `{cfg.bucket}`")
+            if st.button("Upload savings report (PDF) + audit trail (CSV) to S3"):
+                today = datetime.now().strftime("%Y-%m-%d")
+                with st.spinner("Uploading to S3..."):
+                    pdf_res = client.upload_report(
+                        f"savings_reports/{F.id}/{today}.pdf",
+                        savings_report_pdf(R, [m for m in MEASURES if m.strip()]),
+                        "application/pdf",
+                    )
+                    csv_res = client.upload_report(
+                        f"audit_trail/{F.id}/{today}.csv",
+                        audit_trail_csv_bytes(R.audit.frame()),
+                        "text/csv",
+                    )
+                (st.success if pdf_res.ok else st.error)(pdf_res.message)
+                (st.success if csv_res.ok else st.error)(csv_res.message)
+            objs = client.list_reports(f"savings_reports/{F.id}/")
+            if objs:
+                st.markdown("**Already in S3:**")
+                for key in objs:
+                    st.caption(f"s3://{cfg.bucket}/{key}")

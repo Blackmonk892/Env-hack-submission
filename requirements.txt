@@ -22,3 +22,9 @@ uvicorn>=0.29
 python-multipart>=0.0.9
 reportlab>=4.0
 httpx>=0.27
+# AWS integration: S3 (reports/audit trail) and DynamoDB (daily ledger telemetry).
+# Works against real AWS or a local LocalStack endpoint (AWS_ENDPOINT_URL).
+boto3>=1.34
+# Test-only: in-process AWS mock so the AWS integration tests run with no Docker,
+# no network and no credentials (pytest -m "not aws" to skip if ever needed).
+moto[s3,dynamodb]>=5.0

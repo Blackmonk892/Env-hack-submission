@@ -1,7 +1,9 @@
 # UnitWatt
 
 A software-only energy and carbon ledger for Indian MSME factories: the working prototype for
-Challenge 4 (Smart Manufacturing for Indian MSMEs).
+Challenge 4 (Smart Manufacturing for Indian MSMEs), submitted to **Environmental Hacks: Bharat
+Builds Tour** (WeMakeDevs × AWS, Oct 2026), **Track 03 — Waste and Energy** (energy efficiency,
+smart consumption, rooftop-solar-ready scheduling).
 
 Most small factories see one monthly electricity bill and cannot say how much energy or carbon
 goes into each unit they make. UnitWatt turns the paperwork a factory already has (electricity
@@ -25,6 +27,43 @@ baseline, to split emissions across products, and as the expectation the drift a
 against. The tariff engine reprices bills and prices every 15-minute slot for the scheduler.
 Dashed boxes are built but not live-tested or use placeholder values; dotted boxes are planned.
 
+## AWS architecture (mandatory track requirement)
+
+UnitWatt's core pipeline is deliberately software-only and runs entirely offline — AWS is used
+for exactly the two things a factory's energy ledger needs once it leaves one laptop:
+
+```
+Bills / meter CSVs / registers  →  UnitWatt pipeline (local, offline)  →  daily ledger (pandas)
+                                                                               │
+                                        ┌──────────────────────────────────────┴───────────────────────┐
+                                        ▼                                                                ▼
+                          Amazon DynamoDB (unitwatt_daily_ledger)               Amazon S3 (unitwatt-energy-ledger)
+                          one item per factory-day: elec_kwh,                   savings_reports/<factory>/<date>.pdf
+                          sec_kwh_per_t, total_t, grid/DG split                 audit_trail/<factory>/<date>.csv
+```
+
+- **Amazon DynamoDB** (`unitwatt_daily_ledger`, partition key `factory_id`, sort key `date`) stores
+  the daily energy-per-unit telemetry — exactly the "Smart Consumption" signal the track asks for —
+  so it can be queried by any downstream tool without re-running the Python pipeline.
+- **Amazon S3** (`unitwatt-energy-ledger`) stores the audit-ready artifacts: the IPMVP savings
+  report PDF (P15) and the SHA-256 hash-chained audit trail export (P17), so a bank, auditor or
+  scheme officer can be handed a durable link instead of a local file.
+- Implementation: `unitwatt/aws_integration.py` (`AWSConfig`, `AWSClient`), wired into the
+  dashboard's **☁️ AWS Cloud Sync** tab (provision resources, sync the ledger, upload reports) with
+  boto3. Every call fails soft — a missing or expired credential shows a status message in the UI,
+  never a crash, so the rest of the dashboard works with or without AWS configured.
+- **No AWS account needed to try it ("Build It" track):** run `pip install localstack && localstack
+  start`, then set `UNITWATT_AWS_ENABLED=1` and `AWS_ENDPOINT_URL=http://localhost:4566` in `.env`.
+  The same code path runs against LocalStack or real AWS; only the endpoint changes.
+- **Real AWS ("Ship It" track):** set `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+  `AWS_REGION` in `.env` (see `.env.example`). UnitWatt creates the bucket and table on first use.
+- **Tested end to end:** `tests/test_aws_integration.py` runs the real boto3 calls — create
+  bucket/table, write and count ledger items, upload and list S3 objects — against an in-process
+  AWS mock (`moto`), so the integration is verified correct with no Docker, network or credentials.
+- **Already wired into the demo:** when `UNITWATT_AWS_ENABLED=1`, the dashboard auto-syncs the
+  loaded factory's daily ledger to DynamoDB as soon as the app opens (shown in the sidebar); the
+  Cloud Sync tab is for provisioning resources and pushing the savings report/audit trail to S3.
+
 ## Run it
 
 ```bash
@@ -35,7 +74,7 @@ streamlit run app.py              # the dashboard, including a WhatsApp bot simu
 python -m unitwatt                # the same pipeline from the command line; writes reports to data/generated/
 python -m unitwatt.bot chat       # chat with the bot in the terminal, as the owner, supervisor or accountant
 uvicorn unitwatt.server:app       # the WhatsApp webhook and REST API (see "The WhatsApp bot")
-pytest                            # 104 tests
+pytest                            # 111 tests
 python -m unitwatt.extract_eval   # score bill reading against the sample bills, field by field
 ```
 
@@ -176,6 +215,7 @@ Slide-ready screenshots of each tab, taken from the running app, are in `docs/de
 | Alerts | Owner, electrician | CUSUM and EWMA drift monitor with a plain-language explanation |
 | Data & audit | Everyone | Data-quality score, meter gaps, fuel stock-flow, the daily ledger, SHA-256 audit chain, 30-second chat entry |
 | Impact model | Judges | The deep dive's assumptions as inputs, with the scaling scenario and half-shift sensitivity |
+| ☁️ AWS Cloud Sync | Judges | Live AWS status, one-click provisioning, pushing the daily ledger to DynamoDB and the savings report/audit trail to S3 |
 
 ## How the code maps to the deep dive
 
@@ -200,6 +240,7 @@ Slide-ready screenshots of each tab, taken from the running app, are in `docs/de
 | P17 Traceability | `audit.py`, `report.py`, `report_pdf.py` | SHA-256 per document, hash-chained append-only log, source appendix on every report (HTML and PDF) |
 | P19 Sensitive data | `audit.record_consent`, `bot/core.py` | Explicit consent recorded before any report is shared; the bot answers only registered numbers, each within its role; the REST API needs a token |
 | P20 Every state differs | `config/` | Tariffs, sectors and factories are data, not code |
+| Cloud telemetry and durable audit storage | `aws_integration.py` | Daily ledger synced to Amazon DynamoDB; savings report PDF and audit trail synced to Amazon S3; same code path against LocalStack or real AWS |
 
 ## What is real and what is illustrative
 
